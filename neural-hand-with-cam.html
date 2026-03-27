@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neural Hands</title>
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  background: #000;
+  width: 100vw; height: 100vh;
+  overflow: hidden;
+  font-family: 'Courier New', monospace;
+}
+
+#vid {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  /* VISIBLE — shows live camera */
+  opacity: 1;
+  pointer-events: none;
+}
+
+#cv {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  /* canvas overlays on top of video */
+  z-index: 2;
+}
+
+#loader {
+  position: fixed; inset: 0;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  z-index: 100;
+  transition: opacity .7s ease;
+}
+#loader.fade { opacity: 0; pointer-events: none; }
+
+.ring {
+  width: 56px; height: 56px;
+  border: 2px solid rgba(0,229,255,.15);
+  border-top-color: #00e5ff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#ltext {
+  color: rgba(0,229,255,.65);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+#status {
+  position: fixed;
+  top: 18px; left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 16px;
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(0,0,0,.55);
+  color: rgba(255,255,255,.4);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  backdrop-filter: blur(6px);
+  z-index: 50;
+  transition: color .3s, border-color .3s;
+}
+#status.on { color: #00ffea; border-color: rgba(0,255,234,.35); }
+
+#hint {
+  position: fixed;
+  bottom: 18px; left: 50%;
+  transform: translateX(-50%);
+  color: rgba(255,255,255,.22);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  z-index: 50;
+  white-space: nowrap;
+}
+</style>
+</head>
+<body>
+
+<video id="vid" autoplay playsinline muted></video>
+<canvas id="cv"></canvas>
+
+<div id="loader">
+  <div class="ring"></div>
+  <div id="ltext">Loading neural engine…</div>
+</div>
+
+<div id="status">Waiting for hands</div>
+<div id="hint">Show both hands · lines bridge left ↔ right at each landmark</div>
+
+<script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+
+<script>
+/* ── fluorescent colours per landmark ── */
+const C = [
+  '#00ffea', // 0  wrist   — electric cyan
+  '#ff2d55','#ff2d55','#ff2d55','#ff2d55',       // 1-4  thumb    — hot red
+  '#ffe600','#ffe600','#ffe600','#ffe600',         // 5-8  index   — neon yellow
+  '#00ff85','#00ff85','#00ff85','#00ff85',         // 9-12 middle  — acid green
+  '#00b4ff','#00b4ff','#00b4ff','#00b4ff',         // 13-16 ring   — electric blue
+  '#df00ff','#df00ff','#df00ff','#df00ff',         // 17-20 pinky  — neon violet
+];
+
+const TIPS = new Set([4,8,12,16,20]);
+
+const SEGS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],
+];
+
+const vid    = document.getElementById('vid');
+const canvas = document.getElementById('cv');
+const ctx    = canvas.getContext('2d');
+const stEl   = document.getElementById('status');
+const loader = document.getElementById('loader');
+
+let W = 0, H = 0;
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+function px(lm) { return (1 - lm.x) * W; }
+function py(lm) { return lm.y * H; }
+
+function hexAlpha(a) {
+  return Math.round(Math.max(0,Math.min(1,a))*255).toString(16).padStart(2,'0');
+}
+
+/* ── THICK fluorescent glowing line ── */
+function glowLine(x1,y1,x2,y2,c1,c2,alpha,w) {
+  /* deep dark shadow layer for contrast */
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.9)';
+  ctx.shadowBlur  = 0;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+  ctx.lineWidth   = w + 5;
+  ctx.lineCap     = 'round';
+  ctx.stroke();
+  ctx.restore();
+
+  /* outer wide glow */
+  ctx.save();
+  ctx.shadowColor = c1;
+  ctx.shadowBlur  = 22;
+  const g1 = ctx.createLinearGradient(x1,y1,x2,y2);
+  g1.addColorStop(0, c1 + hexAlpha(alpha * 0.35));
+  g1.addColorStop(1, c2 + hexAlpha(alpha * 0.35));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle = g1; ctx.lineWidth = w + 6; ctx.lineCap = 'round';
+  ctx.stroke();
+  ctx.restore();
+
+  /* bright solid core */
+  ctx.save();
+  ctx.shadowColor = c1; ctx.shadowBlur = 14;
+  const g2 = ctx.createLinearGradient(x1,y1,x2,y2);
+  g2.addColorStop(0, c1 + hexAlpha(alpha));
+  g2.addColorStop(1, c2 + hexAlpha(alpha));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle = g2; ctx.lineWidth = w; ctx.lineCap = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ── big glowing dot ── */
+function glowDot(x,y,color,r) {
+  /* dark ring for contrast */
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x,y,r+4,0,Math.PI*2);
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fill();
+  ctx.restore();
+
+  /* outer halo */
+  ctx.save();
+  ctx.shadowColor = color; ctx.shadowBlur = 20;
+  const g = ctx.createRadialGradient(x,y,0, x,y,r*4.5);
+  g.addColorStop(0,   color + 'ee');
+  g.addColorStop(0.45,color + '66');
+  g.addColorStop(1,   color + '00');
+  ctx.beginPath(); ctx.arc(x,y,r*4.5,0,Math.PI*2);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.restore();
+
+  /* white-hot core */
+  ctx.save();
+  ctx.shadowColor = color; ctx.shadowBlur = 16;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fillStyle = '#ffffff'; ctx.fill();
+
+  /* colour ring */
+  ctx.beginPath(); ctx.arc(x,y,r+2,0,Math.PI*2);
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+}
+
+/* ── draw one hand ── */
+function drawHand(lms) {
+  SEGS.forEach(([a,b]) => {
+    glowLine(px(lms[a]),py(lms[a]), px(lms[b]),py(lms[b]), C[a],C[b], 0.95, 3.5);
+  });
+  lms.forEach((lm,i) => glowDot(px(lm),py(lm), C[i], TIPS.has(i) ? 7 : 5));
+}
+
+/* ── bridge between hands ── */
+function drawBridge(L,R) {
+  for (let i=0; i<21; i++) {
+    const x1=px(L[i]), y1=py(L[i]);
+    const x2=px(R[i]), y2=py(R[i]);
+    const dist  = Math.hypot(x2-x1,y2-y1);
+    const diag  = Math.hypot(W,H);
+    const alpha = Math.max(0.25, 0.9 - (dist/diag)*0.6);
+    glowLine(x1,y1, x2,y2, C[i],C[i], alpha, 2.2);
+  }
+}
+
+/* ── MediaPipe result handler ── */
+let firstFrame = false;
+
+function onResults(results) {
+  if (!firstFrame) {
+    firstFrame = true;
+    loader.classList.add('fade');
+    setTimeout(() => { loader.style.display='none'; }, 800);
+  }
+
+  ctx.clearRect(0,0,W,H);
+
+  const lms   = results.multiHandLandmarks || [];
+  const infos = results.multiHandedness    || [];
+
+  if (lms.length === 0) {
+    stEl.textContent = 'Waiting for hands';
+    stEl.classList.remove('on');
+    return;
+  }
+
+  stEl.textContent = lms.length===1 ? '1 hand detected' : '2 hands · web active';
+  stEl.classList.add('on');
+
+  let leftLms=null, rightLms=null;
+  infos.forEach((info,idx) => {
+    if (info.label==='Left')  rightLms=lms[idx];
+    if (info.label==='Right') leftLms =lms[idx];
+  });
+
+  if (leftLms && rightLms) drawBridge(leftLms, rightLms);
+  lms.forEach(h => drawHand(h));
+}
+
+/* ── MediaPipe Hands ── */
+const hands = new Hands({
+  locateFile: f => `https://unpkg.com/@mediapipe/hands@0.4.1646424915/${f}`
+});
+hands.setOptions({
+  maxNumHands: 2, modelComplexity: 1,
+  minDetectionConfidence: 0.75, minTrackingConfidence: 0.6,
+});
+hands.onResults(onResults);
+
+/* ── Camera via getUserMedia ── */
+async function startCamera() {
+  document.getElementById('ltext').textContent = 'Requesting camera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width:{ideal:1280}, height:{ideal:720}, facingMode:'user' },
+      audio: false,
+    });
+    vid.srcObject = stream;
+    await vid.play();
+    document.getElementById('ltext').textContent = 'Initialising model…';
+    (async function loop() {
+      if (vid.readyState >= 2) await hands.send({ image: vid });
+      requestAnimationFrame(loop);
+    })();
+  } catch(err) {
+    document.getElementById('ltext').textContent = 'Camera error: ' + err.message;
+  }
+}
+
+startCamera();
+</script>
+</body>
+</html>
