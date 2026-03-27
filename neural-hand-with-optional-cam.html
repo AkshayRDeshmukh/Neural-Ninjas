@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neural Vision</title>
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  background: #000;
+  width: 100vw; height: 100vh;
+  overflow: hidden;
+  font-family: 'Courier New', monospace;
+}
+
+#vid {
+  position: absolute; top:0; left:0;
+  width:100%; height:100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  opacity: 1;
+  pointer-events: none;
+  z-index: 1;
+  transition: opacity .45s ease;
+}
+
+#cv {
+  position: absolute; top:0; left:0;
+  width:100%; height:100%;
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* ── loader ── */
+#loader {
+  position:fixed; inset:0;
+  background:#000;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:18px; z-index:100;
+  transition: opacity .7s ease;
+}
+#loader.fade { opacity:0; pointer-events:none; }
+
+.ring {
+  width:52px; height:52px;
+  border:2px solid rgba(0,255,200,.1);
+  border-top-color:#00ffc8;
+  border-radius:50%;
+  animation:spin 1s linear infinite;
+}
+@keyframes spin { to { transform:rotate(360deg); } }
+
+#ltext {
+  color:rgba(0,255,200,.6);
+  font-size:11px;
+  letter-spacing:.2em;
+  text-transform:uppercase;
+}
+
+/* ── status ── */
+#status {
+  position:fixed; top:16px; left:50%; transform:translateX(-50%);
+  padding:5px 18px;
+  border-radius:20px;
+  border:1px solid rgba(255,255,255,.1);
+  background:rgba(0,0,0,.55);
+  color:rgba(255,255,255,.35);
+  font-size:10px; letter-spacing:.18em; text-transform:uppercase;
+  backdrop-filter:blur(8px);
+  z-index:50;
+  transition:color .3s, border-color .3s;
+  white-space:nowrap;
+}
+#status.on { color:#00ffc8; border-color:rgba(0,255,200,.3); }
+
+/* ── controls ── */
+#controls {
+  position:fixed; bottom:24px; right:24px;
+  display:flex; flex-direction:column; align-items:flex-end; gap:10px;
+  z-index:50;
+}
+
+.ctrl-btn {
+  display:flex; align-items:center; gap:9px;
+  padding:9px 18px;
+  border-radius:30px;
+  border:1px solid rgba(255,255,255,.15);
+  background:rgba(0,0,0,.6);
+  color:rgba(255,255,255,.65);
+  font-size:10px; letter-spacing:.15em; text-transform:uppercase;
+  cursor:pointer;
+  backdrop-filter:blur(10px);
+  transition:background .2s, border-color .2s, color .2s;
+  user-select:none;
+  font-family:'Courier New',monospace;
+}
+.ctrl-btn:hover { background:rgba(30,30,30,.8); }
+.ctrl-btn.active { border-color:rgba(0,255,200,.4); color:#00ffc8; }
+
+.btn-dot {
+  width:6px; height:6px; border-radius:50%;
+  background:rgba(255,255,255,.3);
+  flex-shrink:0;
+  transition:background .2s, box-shadow .2s;
+}
+.ctrl-btn.active .btn-dot {
+  background:#00ffc8;
+  box-shadow:0 0 8px #00ffc8;
+}
+
+#hint {
+  position:fixed; bottom:20px; left:24px;
+  color:rgba(255,255,255,.18);
+  font-size:10px; letter-spacing:.1em;
+  z-index:50;
+}
+</style>
+</head>
+<body>
+
+<video id="vid" autoplay playsinline muted></video>
+<canvas id="cv"></canvas>
+
+<div id="loader">
+  <div class="ring"></div>
+  <div id="ltext">Loading neural models…</div>
+</div>
+
+<div id="status">Initialising…</div>
+
+<div id="controls">
+  <button class="ctrl-btn active" id="camBtn" onclick="toggleCam()">
+    <span class="btn-dot"></span><span id="camLabel">Camera On</span>
+  </button>
+</div>
+
+<div id="hint">Up to 4 faces · 2 hands · face↔hand bridges</div>
+
+<script src="https://unpkg.com/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"></script>
+<script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+
+<script>
+/* ═══════════════════════════════════════════════════
+   COLOUR SYSTEM
+═══════════════════════════════════════════════════ */
+
+/* Per-face palettes — each detected face gets a distinct scheme */
+const FACE_PALETTES = [
+  { oval:'#00ffff', eyeL:'#00ccff', eyeR:'#00aaff', lip:'#ff0088', brow:'#aaff00', nose:'#ffcc00' },
+  { oval:'#ff00ff', eyeL:'#ff00cc', eyeR:'#cc00ff', lip:'#00ffcc', brow:'#ffff00', nose:'#ff6600' },
+  { oval:'#00ff88', eyeL:'#00ffcc', eyeR:'#00ff55', lip:'#ff4499', brow:'#ccff00', nose:'#ff8800' },
+  { oval:'#ffaa00', eyeL:'#ff7700', eyeR:'#ffcc00', lip:'#00ffff', brow:'#ff00ff', nose:'#00ff88' },
+];
+
+/* Hand landmark colours (per index) */
+const HC = [
+  '#00ffea',
+  '#ff2255','#ff2255','#ff2255','#ff2255',
+  '#ffe600','#ffe600','#ffe600','#ffe600',
+  '#00ff85','#00ff85','#00ff85','#00ff85',
+  '#00aaff','#00aaff','#00aaff','#00aaff',
+  '#cc44ff','#cc44ff','#cc44ff','#cc44ff',
+];
+
+/* Dot colours — vivid, one per landmark group (for face) */
+const DOT_VIVID = [
+  '#ff0077','#ff4400','#ffcc00','#88ff00',
+  '#00ffcc','#00aaff','#aa00ff','#ff00aa',
+  '#00ff55','#ff7700','#ff0055','#00ffff',
+];
+
+const TIPS = new Set([4,8,12,16,20]);
+
+/* ═══════════════════════════════════════════════════
+   FACE MESH GROUPS
+═══════════════════════════════════════════════════ */
+const FACE_OVAL  = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+const L_EYE      = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+const R_EYE      = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
+const LIPS_OUT   = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+const LIPS_IN    = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
+const NOSE       = [168,6,197,195,5,4,1,19,94,2,370,462,250,309,392,37,72,38,41,42];
+const L_BROW     = [70,63,105,66,107,55,65,52,53,46];
+const R_BROW     = [300,293,334,296,336,285,295,282,283,276];
+const L_IRIS     = [474,475,476,477];
+const R_IRIS     = [469,470,471,472];
+
+/* Bridge source points on face — key visible landmarks */
+const FACE_BRIDGE_PTS = [
+  1,   /* nose tip */
+  61,  /* mouth left */
+  291, /* mouth right */
+  33,  /* left eye inner */
+  263, /* right eye inner */
+  10,  /* forehead top */
+  152, /* chin */
+  234, /* left cheek */
+  454, /* right cheek */
+  107, /* left brow peak */
+  336, /* right brow peak */
+];
+
+const HAND_SEGS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],
+];
+
+/* ═══════════════════════════════════════════════════
+   CANVAS SETUP
+═══════════════════════════════════════════════════ */
+const vid    = document.getElementById('vid');
+const canvas = document.getElementById('cv');
+const ctx    = canvas.getContext('2d');
+const stEl   = document.getElementById('status');
+const loader = document.getElementById('loader');
+
+let W=0, H=0;
+function resize() { W=canvas.width=window.innerWidth; H=canvas.height=window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+const px = lm => (1-lm.x)*W;
+const py = lm => lm.y*H;
+
+function hexAlpha(a) {
+  return Math.round(Math.max(0,Math.min(1,a))*255).toString(16).padStart(2,'0');
+}
+
+/* ═══════════════════════════════════════════════════
+   DRAW PRIMITIVES — clean fluorescent, no border
+═══════════════════════════════════════════════════ */
+
+/* Sharp fluorescent line — glow only, no dark coat */
+function neonLine(x1,y1,x2,y2,c1,c2,alpha,w) {
+  /* outer bloom */
+  ctx.save();
+  ctx.shadowColor = c1;
+  ctx.shadowBlur  = 18;
+  const gOuter = ctx.createLinearGradient(x1,y1,x2,y2);
+  gOuter.addColorStop(0, c1+hexAlpha(alpha*0.4));
+  gOuter.addColorStop(1, c2+hexAlpha(alpha*0.4));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle = gOuter;
+  ctx.lineWidth   = w*2.8;
+  ctx.lineCap     = 'round';
+  ctx.stroke();
+  ctx.restore();
+
+  /* sharp core */
+  ctx.save();
+  ctx.shadowColor = c1;
+  ctx.shadowBlur  = 10;
+  const gCore = ctx.createLinearGradient(x1,y1,x2,y2);
+  gCore.addColorStop(0, c1+hexAlpha(alpha));
+  gCore.addColorStop(1, c2+hexAlpha(alpha));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle = gCore;
+  ctx.lineWidth   = w;
+  ctx.lineCap     = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* Thin face line */
+function thinNeon(x1,y1,x2,y2,color,alpha) {
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur  = 10;
+  const g = ctx.createLinearGradient(x1,y1,x2,y2);
+  g.addColorStop(0, color+hexAlpha(alpha*0.45));
+  g.addColorStop(0.5, color+hexAlpha(alpha));
+  g.addColorStop(1, color+hexAlpha(alpha*0.45));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle = g;
+  ctx.lineWidth   = 1.0;
+  ctx.lineCap     = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* Vivid point dot — colorful, no border, sharp glow */
+function vivDot(x,y,color,r) {
+  /* bloom halo */
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur  = 14;
+  const g = ctx.createRadialGradient(x,y,0,x,y,r*3.5);
+  g.addColorStop(0,   color+'cc');
+  g.addColorStop(0.5, color+'44');
+  g.addColorStop(1,   color+'00');
+  ctx.beginPath(); ctx.arc(x,y,r*3.5,0,Math.PI*2);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.restore();
+
+  /* solid vivid core */
+  ctx.save();
+  ctx.shadowColor = color; ctx.shadowBlur = 10;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fillStyle   = color; ctx.fill();
+  /* tiny white centre */
+  ctx.beginPath(); ctx.arc(x,y,r*0.38,0,Math.PI*2);
+  ctx.fillStyle   = '#ffffff'; ctx.fill();
+  ctx.restore();
+}
+
+/* ═══════════════════════════════════════════════════
+   DRAW FACE MESH  (one face, given palette)
+═══════════════════════════════════════════════════ */
+function drawFace(lms, pal) {
+  const groups = [
+    { pts:FACE_OVAL, color:pal.oval,  loop:true  },
+    { pts:L_EYE,     color:pal.eyeL,  loop:true  },
+    { pts:R_EYE,     color:pal.eyeR,  loop:true  },
+    { pts:LIPS_OUT,  color:pal.lip,   loop:true  },
+    { pts:LIPS_IN,   color:pal.lip,   loop:true  },
+    { pts:NOSE,      color:pal.nose,  loop:false },
+    { pts:L_BROW,    color:pal.brow,  loop:false },
+    { pts:R_BROW,    color:pal.brow,  loop:false },
+    { pts:L_IRIS,    color:pal.eyeL,  loop:true  },
+    { pts:R_IRIS,    color:pal.eyeR,  loop:true  },
+  ];
+
+  groups.forEach(({ pts, color, loop }) => {
+    /* lines */
+    for(let i=0; i<pts.length-1; i++){
+      const a=lms[pts[i]], b=lms[pts[i+1]];
+      if(a&&b) thinNeon(px(a),py(a),px(b),py(b),color,0.8);
+    }
+    if(loop && pts.length>1){
+      const a=lms[pts[pts.length-1]], b=lms[pts[0]];
+      if(a&&b) thinNeon(px(a),py(a),px(b),py(b),color,0.8);
+    }
+    /* dots — pick a vivid colour per group index */
+    pts.forEach((idx, gi) => {
+      const lm=lms[idx];
+      if(!lm) return;
+      const dc = DOT_VIVID[(idx % DOT_VIVID.length)];
+      vivDot(px(lm),py(lm), dc, 1.6);
+    });
+  });
+}
+
+/* ═══════════════════════════════════════════════════
+   DRAW HANDS
+═══════════════════════════════════════════════════ */
+function drawHand(lms) {
+  HAND_SEGS.forEach(([a,b]) => {
+    neonLine(px(lms[a]),py(lms[a]),px(lms[b]),py(lms[b]),HC[a],HC[b],1.0,2.8);
+  });
+  lms.forEach((lm,i) => vivDot(px(lm),py(lm), HC[i], TIPS.has(i)?5.5:3.5));
+}
+
+function drawHandBridge(L,R) {
+  for(let i=0;i<21;i++){
+    const x1=px(L[i]),y1=py(L[i]),x2=px(R[i]),y2=py(R[i]);
+    const dist=Math.hypot(x2-x1,y2-y1), diag=Math.hypot(W,H);
+    const alpha=Math.max(0.18, 0.85-(dist/diag)*0.6);
+    neonLine(x1,y1,x2,y2,HC[i],HC[i],alpha,1.8);
+  }
+}
+
+/* ═══════════════════════════════════════════════════
+   FACE ↔ HAND BRIDGES (random, regenerate every 1.2s)
+═══════════════════════════════════════════════════ */
+let bridgeMap=[], lastRegen=0;
+
+function regenBridges(allFaces, allHands) {
+  bridgeMap=[];
+  if(!allFaces.length || !allHands.length) return;
+  const numLines = 10 + allFaces.length*4;
+  for(let i=0;i<numLines;i++){
+    const face = allFaces[Math.floor(Math.random()*allFaces.length)];
+    const fi   = FACE_BRIDGE_PTS[Math.floor(Math.random()*FACE_BRIDGE_PTS.length)];
+    const hand = allHands[Math.floor(Math.random()*allHands.length)];
+    const hi   = [0,4,8,12,16,20][Math.floor(Math.random()*6)];
+    const col  = DOT_VIVID[Math.floor(Math.random()*DOT_VIVID.length)];
+    bridgeMap.push({ face, fi, hand, hi, col });
+  }
+}
+
+function drawFaceHandBridges() {
+  bridgeMap.forEach(({ face, fi, hand, hi, col }) => {
+    const fa=face[fi], ha=hand[hi];
+    if(!fa||!ha) return;
+    const x1=px(fa),y1=py(fa),x2=px(ha),y2=py(ha);
+    const dist=Math.hypot(x2-x1,y2-y1), diag=Math.hypot(W,H);
+    const alpha=Math.max(0.1, 0.55-(dist/diag)*0.5);
+    thinNeon(x1,y1,x2,y2,col,alpha);
+  });
+}
+
+/* ═══════════════════════════════════════════════════
+   STATE
+═══════════════════════════════════════════════════ */
+let latestFaces = [];   /* array of landmark arrays */
+let latestLeft  = null;
+let latestRight = null;
+let firstFrame  = false;
+
+function frame() {
+  ctx.clearRect(0,0,W,H);
+
+  const allHands = [latestLeft,latestRight].filter(Boolean);
+  const allFaces = latestFaces;
+
+  /* status */
+  const parts=[];
+  if(allFaces.length) parts.push(`${allFaces.length} face${allFaces.length>1?'s':''}`);
+  if(allHands.length) parts.push(`${allHands.length} hand${allHands.length>1?'s':''}`);
+  if(parts.length){ stEl.textContent=parts.join(' · ').toUpperCase(); stEl.classList.add('on'); }
+  else { stEl.textContent='Waiting…'; stEl.classList.remove('on'); return; }
+
+  /* regen bridges every 1.2s */
+  const now=Date.now();
+  if(now-lastRegen>1200){ regenBridges(allFaces,allHands); lastRegen=now; }
+
+  /* draw order: bridges → faces → hand bridge → hands */
+  drawFaceHandBridges();
+  allFaces.forEach((lms,i) => drawFace(lms, FACE_PALETTES[i % FACE_PALETTES.length]));
+  if(latestLeft && latestRight) drawHandBridge(latestLeft,latestRight);
+  allHands.forEach(h => drawHand(h));
+}
+
+/* ═══════════════════════════════════════════════════
+   MEDIAPIPE FACE MESH
+═══════════════════════════════════════════════════ */
+const faceMesh = new FaceMesh({
+  locateFile: f => `https://unpkg.com/@mediapipe/face_mesh@0.4.1633559619/${f}`
+});
+faceMesh.setOptions({
+  maxNumFaces          : 4,
+  refineLandmarks      : true,
+  minDetectionConfidence: 0.55,
+  minTrackingConfidence : 0.55,
+});
+faceMesh.onResults(r => {
+  latestFaces = r.multiFaceLandmarks || [];
+  if(!firstFrame){ firstFrame=true; loader.classList.add('fade'); setTimeout(()=>loader.style.display='none',800); }
+});
+
+/* ═══════════════════════════════════════════════════
+   MEDIAPIPE HANDS
+═══════════════════════════════════════════════════ */
+const handDet = new Hands({
+  locateFile: f => `https://unpkg.com/@mediapipe/hands@0.4.1646424915/${f}`
+});
+handDet.setOptions({
+  maxNumHands:4, modelComplexity:1,
+  minDetectionConfidence:0.65, minTrackingConfidence:0.6,
+});
+handDet.onResults(r => {
+  latestLeft=null; latestRight=null;
+  const lms=r.multiHandLandmarks||[], infos=r.multiHandedness||[];
+  infos.forEach((info,i) => {
+    if(info.label==='Left')  latestRight=lms[i];
+    if(info.label==='Right') latestLeft =lms[i];
+  });
+});
+
+/* ═══════════════════════════════════════════════════
+   CAMERA + RAF LOOP
+═══════════════════════════════════════════════════ */
+async function startCamera() {
+  document.getElementById('ltext').textContent='Requesting camera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' },
+      audio:false,
+    });
+    vid.srcObject=stream;
+    await vid.play();
+    document.getElementById('ltext').textContent='Loading models…';
+
+    async function loop() {
+      if(vid.readyState>=2){
+        /* run both detectors on same frame, sequentially */
+        await faceMesh.send({ image:vid });
+        await handDet.send({ image:vid });
+        frame();
+      }
+      requestAnimationFrame(loop);
+    }
+    loop();
+  } catch(err) {
+    document.getElementById('ltext').textContent='Camera error: '+err.message;
+  }
+}
+
+/* ═══════════════════════════════════════════════════
+   CAMERA TOGGLE
+═══════════════════════════════════════════════════ */
+let camOn=true;
+function toggleCam() {
+  camOn=!camOn;
+  const btn=document.getElementById('camBtn');
+  const lbl=document.getElementById('camLabel');
+  vid.style.opacity = camOn?'1':'0';
+  vid.style.zIndex  = camOn?'1':'-1';
+  btn.classList.toggle('active', camOn);
+  lbl.textContent   = camOn?'Camera On':'Camera Off';
+}
+
+startCamera();
+</script>
+</body>
+</html>
