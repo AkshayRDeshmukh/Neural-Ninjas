@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neural Hands + Face</title>
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  background: #000;
+  width: 100vw; height: 100vh;
+  overflow: hidden;
+  font-family: 'Courier New', monospace;
+}
+
+#vid {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity .4s ease;
+  z-index: 1;
+}
+
+#cv {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* ── loader ── */
+#loader {
+  position: fixed; inset: 0;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  z-index: 100;
+  transition: opacity .7s ease;
+}
+#loader.fade { opacity: 0; pointer-events: none; }
+.ring {
+  width: 56px; height: 56px;
+  border: 2px solid rgba(0,229,255,.15);
+  border-top-color: #00e5ff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#ltext {
+  color: rgba(0,229,255,.65);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+/* ── status pill ── */
+#status {
+  position: fixed;
+  top: 18px; left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 16px;
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(0,0,0,.55);
+  color: rgba(255,255,255,.4);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  backdrop-filter: blur(6px);
+  z-index: 50;
+  transition: color .3s, border-color .3s;
+  white-space: nowrap;
+}
+#status.on { color: #00ffea; border-color: rgba(0,255,234,.3); }
+
+/* ── camera toggle button ── */
+#camBtn {
+  position: fixed;
+  bottom: 28px; right: 28px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 20px;
+  border-radius: 30px;
+  border: 1px solid rgba(255,255,255,.18);
+  background: rgba(0,0,0,.6);
+  color: rgba(255,255,255,.75);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+  transition: background .25s, border-color .25s, color .25s;
+  user-select: none;
+}
+#camBtn:hover { background: rgba(30,30,30,.8); }
+#camBtn.off {
+  border-color: rgba(0,255,234,.35);
+  color: #00ffea;
+}
+#camBtn .dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: rgba(255,255,255,.4);
+  transition: background .25s;
+  flex-shrink: 0;
+}
+#camBtn.off .dot { background: #00ffea; box-shadow: 0 0 6px #00ffea; }
+
+#hint {
+  position: fixed;
+  bottom: 22px; left: 28px;
+  color: rgba(255,255,255,.2);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  z-index: 50;
+}
+</style>
+</head>
+<body>
+
+<video id="vid" autoplay playsinline muted></video>
+<canvas id="cv"></canvas>
+
+<div id="loader">
+  <div class="ring"></div>
+  <div id="ltext">Loading holistic model…</div>
+</div>
+
+<div id="status">Initialising…</div>
+
+<button id="camBtn" onclick="toggleCam()">
+  <span class="dot"></span>
+  <span id="camLabel">Camera On</span>
+</button>
+<div id="hint">Face + hands · 468 face pts · 21 hand pts each</div>
+
+<!-- MediaPipe Holistic (face + hands + pose in one) -->
+<script src="https://unpkg.com/@mediapipe/holistic@0.5.1635989137/holistic.js"></script>
+
+<script>
+/* ───────────────────────────────────────────────
+   COLOUR PALETTES
+─────────────────────────────────────────────── */
+
+/* Hand colours per landmark index */
+const HC = [
+  '#00ffea', // 0  wrist
+  '#ff2d55','#ff2d55','#ff2d55','#ff2d55',
+  '#ffe600','#ffe600','#ffe600','#ffe600',
+  '#00ff85','#00ff85','#00ff85','#00ff85',
+  '#00b4ff','#00b4ff','#00b4ff','#00b4ff',
+  '#df00ff','#df00ff','#df00ff','#df00ff',
+];
+const TIPS = new Set([4,8,12,16,20]);
+
+/* Hand skeleton */
+const HSEGS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],
+];
+
+/* Face mesh — key landmark groups to draw (subset of 468) */
+/* Face oval */
+const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,
+                   397,365,379,378,400,377,152,148,176,149,150,136,
+                   172,58,132,93,234,127,162,21,54,103,67,109];
+/* Left eye */
+const L_EYE  = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+/* Right eye */
+const R_EYE  = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
+/* Lips outer */
+const LIPS   = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+/* Nose bridge */
+const NOSE   = [168,6,197,195,5,4,1,19,94,2];
+/* Left brow */
+const L_BROW = [70,63,105,66,107,55,65,52,53,46];
+/* Right brow */
+const R_BROW = [300,293,334,296,336,285,295,282,283,276];
+
+/* Face colour — electric teal for all face points */
+const FACE_COLOR   = '#00ffff';
+const FACE_COLOR2  = '#ff00aa'; /* lips */
+const FACE_COLOR3  = '#aaff00'; /* brows */
+const FACE_COLOR4  = '#ff9900'; /* nose */
+
+/* Which face feature → colour */
+const FACE_GROUPS = [
+  { pts: FACE_OVAL, color: '#00ffff',  loop: true  },
+  { pts: L_EYE,     color: '#00c8ff',  loop: true  },
+  { pts: R_EYE,     color: '#00c8ff',  loop: true  },
+  { pts: LIPS,      color: '#ff00aa',  loop: true  },
+  { pts: NOSE,      color: '#ff9900',  loop: false },
+  { pts: L_BROW,    color: '#aaff00',  loop: false },
+  { pts: R_BROW,    color: '#aaff00',  loop: false },
+];
+
+/* Collect all face landmark indices used → for random bridge picks */
+const ALL_FACE_PTS = [...new Set([
+  ...FACE_OVAL, ...L_EYE, ...R_EYE, ...LIPS, ...NOSE, ...L_BROW, ...R_BROW
+])];
+
+/* Hand tip indices used as bridge targets */
+const HAND_BRIDGE_PTS = [4,8,12,16,20,0];
+
+/* ───────────────────────────────────────────────
+   CANVAS SETUP
+─────────────────────────────────────────────── */
+const vid    = document.getElementById('vid');
+const canvas = document.getElementById('cv');
+const ctx    = canvas.getContext('2d');
+const stEl   = document.getElementById('status');
+const loader = document.getElementById('loader');
+
+let W=0, H=0;
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+/* landmark → mirrored canvas coords */
+function px(lm) { return (1 - lm.x) * W; }
+function py(lm) { return lm.y * H;       }
+
+function hexAlpha(a) {
+  return Math.round(Math.max(0,Math.min(1,a))*255).toString(16).padStart(2,'0');
+}
+
+/* ───────────────────────────────────────────────
+   DRAW PRIMITIVES
+─────────────────────────────────────────────── */
+
+/* Thick fluorescent line for hands */
+function glowLine(x1,y1,x2,y2,c1,c2,alpha,w) {
+  /* dark undercoat */
+  ctx.save();
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle='rgba(0,0,0,0.55)'; ctx.lineWidth=w+5; ctx.lineCap='round'; ctx.stroke();
+  ctx.restore();
+  /* wide glow */
+  ctx.save();
+  ctx.shadowColor=c1; ctx.shadowBlur=18;
+  const g1=ctx.createLinearGradient(x1,y1,x2,y2);
+  g1.addColorStop(0,c1+hexAlpha(alpha*.35)); g1.addColorStop(1,c2+hexAlpha(alpha*.35));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle=g1; ctx.lineWidth=w+6; ctx.lineCap='round'; ctx.stroke();
+  ctx.restore();
+  /* bright core */
+  ctx.save();
+  ctx.shadowColor=c1; ctx.shadowBlur=12;
+  const g2=ctx.createLinearGradient(x1,y1,x2,y2);
+  g2.addColorStop(0,c1+hexAlpha(alpha)); g2.addColorStop(1,c2+hexAlpha(alpha));
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle=g2; ctx.lineWidth=w; ctx.lineCap='round'; ctx.stroke();
+  ctx.restore();
+}
+
+/* Thin face line */
+function thinLine(x1,y1,x2,y2,color,alpha) {
+  ctx.save();
+  ctx.shadowColor=color; ctx.shadowBlur=7;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.strokeStyle=color+hexAlpha(alpha);
+  ctx.lineWidth=1.2; ctx.lineCap='round'; ctx.stroke();
+  ctx.restore();
+}
+
+/* Hand dot */
+function glowDot(x,y,color,r) {
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x,y,r+4,0,Math.PI*2);
+  ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fill();
+  ctx.restore();
+  ctx.save();
+  ctx.shadowColor=color; ctx.shadowBlur=18;
+  const g=ctx.createRadialGradient(x,y,0,x,y,r*4);
+  g.addColorStop(0,color+'ee'); g.addColorStop(0.5,color+'44'); g.addColorStop(1,color+'00');
+  ctx.beginPath(); ctx.arc(x,y,r*4,0,Math.PI*2);
+  ctx.fillStyle=g; ctx.fill();
+  ctx.restore();
+  ctx.save();
+  ctx.shadowColor=color; ctx.shadowBlur=12;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fillStyle='#ffffff'; ctx.fill();
+  ctx.beginPath(); ctx.arc(x,y,r+2,0,Math.PI*2);
+  ctx.strokeStyle=color; ctx.lineWidth=1.8; ctx.stroke();
+  ctx.restore();
+}
+
+/* Small face dot */
+function faceDot(x,y,color) {
+  ctx.save();
+  ctx.shadowColor=color; ctx.shadowBlur=6;
+  ctx.beginPath(); ctx.arc(x,y,1.8,0,Math.PI*2);
+  ctx.fillStyle='#ffffff'; ctx.fill();
+  ctx.beginPath(); ctx.arc(x,y,2.8,0,Math.PI*2);
+  ctx.strokeStyle=color+hexAlpha(0.75); ctx.lineWidth=1; ctx.stroke();
+  ctx.restore();
+}
+
+/* ───────────────────────────────────────────────
+   DRAW FUNCTIONS
+─────────────────────────────────────────────── */
+
+function drawHand(lms) {
+  HSEGS.forEach(([a,b]) => {
+    glowLine(px(lms[a]),py(lms[a]),px(lms[b]),py(lms[b]),HC[a],HC[b],0.95,3.5);
+  });
+  lms.forEach((lm,i) => glowDot(px(lm),py(lm),HC[i],TIPS.has(i)?7:5));
+}
+
+function drawBridgeHands(L,R) {
+  for(let i=0;i<21;i++){
+    const x1=px(L[i]),y1=py(L[i]),x2=px(R[i]),y2=py(R[i]);
+    const dist=Math.hypot(x2-x1,y2-y1), diag=Math.hypot(W,H);
+    const alpha=Math.max(0.2, 0.88-(dist/diag)*0.6);
+    glowLine(x1,y1,x2,y2,HC[i],HC[i],alpha,2.0);
+  }
+}
+
+/* Pre-pick random face↔hand bridge points once per frame */
+let bridgeMap = [];
+let lastBridgeRegen = 0;
+function regenBridge(faceLms, handLmsList) {
+  bridgeMap = [];
+  if (!faceLms || handLmsList.length === 0) return;
+  const numLines = 14; /* total random connections */
+  for (let i=0; i<numLines; i++) {
+    const fi  = ALL_FACE_PTS[Math.floor(Math.random()*ALL_FACE_PTS.length)];
+    const hi  = HAND_BRIDGE_PTS[Math.floor(Math.random()*HAND_BRIDGE_PTS.length)];
+    const hnd = handLmsList[Math.floor(Math.random()*handLmsList.length)];
+    bridgeMap.push({ fi, hi, hnd });
+  }
+}
+
+function drawFaceMesh(faceLms) {
+  /* draw feature groups */
+  FACE_GROUPS.forEach(({ pts, color, loop }) => {
+    for(let i=0; i<pts.length-1; i++){
+      const a=faceLms[pts[i]], b=faceLms[pts[i+1]];
+      if(!a||!b) continue;
+      thinLine(px(a),py(a),px(b),py(b),color,0.65);
+    }
+    if(loop && pts.length > 2) {
+      const a=faceLms[pts[pts.length-1]], b=faceLms[pts[0]];
+      if(a&&b) thinLine(px(a),py(a),px(b),py(b),color,0.65);
+    }
+    /* dots */
+    pts.forEach(idx => {
+      const lm=faceLms[idx];
+      if(lm) faceDot(px(lm),py(lm),color);
+    });
+  });
+}
+
+function drawFaceHandBridge(faceLms, handLmsList) {
+  if(!faceLms || handLmsList.length===0) return;
+  bridgeMap.forEach(({ fi, hi, hnd }) => {
+    const fa=faceLms[fi];
+    const ha=hnd[hi];
+    if(!fa||!ha) return;
+    const x1=px(fa),y1=py(fa),x2=px(ha),y2=py(ha);
+    const dist=Math.hypot(x2-x1,y2-y1), diag=Math.hypot(W,H);
+    const alpha=Math.max(0.12, 0.55-(dist/diag)*0.4);
+    thinLine(x1,y1,x2,y2,'#ff00ff',alpha);
+  });
+}
+
+/* ───────────────────────────────────────────────
+   HOLISTIC RESULT HANDLER
+─────────────────────────────────────────────── */
+let firstFrame=false;
+
+function onResults(res) {
+  if(!firstFrame){
+    firstFrame=true;
+    loader.classList.add('fade');
+    setTimeout(()=>{ loader.style.display='none'; },800);
+  }
+
+  ctx.clearRect(0,0,W,H);
+
+  const faceLms = res.faceLandmarks   || null;
+  const leftLms = res.leftHandLandmarks  || null;   /* from user's left (mirrored right) */
+  const rightLms= res.rightHandLandmarks || null;
+
+  const handList = [leftLms,rightLms].filter(Boolean);
+
+  /* status */
+  const parts=[];
+  if(faceLms)        parts.push('face');
+  if(handList.length) parts.push(handList.length===2?'2 hands':'1 hand');
+  if(parts.length){
+    stEl.textContent=parts.join(' · ').toUpperCase();
+    stEl.classList.add('on');
+  } else {
+    stEl.textContent='Waiting…';
+    stEl.classList.remove('on');
+    return;
+  }
+
+  /* regen random face↔hand bridge every ~1.2 seconds */
+  const now=Date.now();
+  if(now-lastBridgeRegen > 1200){
+    regenBridge(faceLms, handList);
+    lastBridgeRegen=now;
+  }
+
+  /* draw order: bridge(face↔hand) → face → hand bridge → hands */
+  drawFaceHandBridge(faceLms, handList);
+  if(faceLms) drawFaceMesh(faceLms);
+  if(leftLms && rightLms) drawBridgeHands(leftLms, rightLms);
+  handList.forEach(h => drawHand(h));
+}
+
+/* ───────────────────────────────────────────────
+   MEDIAPIPE HOLISTIC
+─────────────────────────────────────────────── */
+const holistic = new Holistic({
+  locateFile: f => `https://unpkg.com/@mediapipe/holistic@0.5.1635989137/${f}`
+});
+
+holistic.setOptions({
+  modelComplexity          : 1,
+  smoothLandmarks          : true,
+  enableSegmentation       : false,
+  smoothSegmentation       : false,
+  refineFaceLandmarks      : true,
+  minDetectionConfidence   : 0.6,
+  minTrackingConfidence    : 0.6,
+});
+
+holistic.onResults(onResults);
+
+/* ───────────────────────────────────────────────
+   CAMERA
+─────────────────────────────────────────────── */
+async function startCamera() {
+  document.getElementById('ltext').textContent='Requesting camera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width:{ideal:1280}, height:{ideal:720}, facingMode:'user' },
+      audio: false,
+    });
+    vid.srcObject=stream;
+    await vid.play();
+    document.getElementById('ltext').textContent='Loading holistic model…';
+    (async function loop(){
+      if(vid.readyState>=2) await holistic.send({ image: vid });
+      requestAnimationFrame(loop);
+    })();
+  } catch(err){
+    document.getElementById('ltext').textContent='Camera error: '+err.message;
+  }
+}
+
+/* ───────────────────────────────────────────────
+   CAMERA TOGGLE
+─────────────────────────────────────────────── */
+let camVisible = true;
+
+function toggleCam() {
+  camVisible = !camVisible;
+  const btn   = document.getElementById('camBtn');
+  const label = document.getElementById('camLabel');
+
+  if (camVisible) {
+    vid.style.opacity  = '1';
+    vid.style.zIndex   = '1';
+    canvas.style.zIndex= '2';
+    btn.classList.remove('off');
+    label.textContent  = 'Camera On';
+  } else {
+    vid.style.opacity  = '0';
+    vid.style.zIndex   = '-1';
+    canvas.style.zIndex= '2';
+    btn.classList.add('off');
+    label.textContent  = 'Camera Off';
+  }
+}
+
+startCamera();
+</script>
+</body>
+</html>
