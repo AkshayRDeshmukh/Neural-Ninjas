@@ -1,4 +1,4 @@
-# 🥷 Neural Ninjas
+# 🥷 Neural Ninjas - DEV1
 
 ### *Play. Experiment. Become an AI Ninja.*
 
